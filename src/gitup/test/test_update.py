@@ -161,7 +161,7 @@ def test_fetch_remotes_no_refspec(capsys):
     remote.name = "origin"
     remote.config_reader.has_option.return_value = False
 
-    _fetch_remotes([remote], prune=False)
+    _fetch_remotes([remote], prune=False, args=_args())
 
     out = capsys.readouterr().out
     assert "skipped" in out
@@ -181,7 +181,7 @@ def test_fetch_remotes_up_to_date(capsys):
     fetch_info.FAST_FORWARD = 4
     remote.fetch.return_value = [fetch_info]
 
-    _fetch_remotes([remote], prune=False)
+    _fetch_remotes([remote], prune=False, args=_args())
 
     out = capsys.readouterr().out
     assert "up to date" in out
@@ -200,10 +200,11 @@ def test_fetch_remotes_new_branch(capsys):
     fetch_info.ref.remote_head = "feature-x"
     remote.fetch.return_value = [fetch_info]
 
-    _fetch_remotes([remote], prune=False)
+    new_branches, _, _ = _fetch_remotes([remote], prune=False, args=_args())
 
     out = capsys.readouterr().out
     assert "feature-x" in out
+    assert "feature-x" in new_branches
 
 
 def test_fetch_remotes_quiet_suppresses_output(capsys):
@@ -212,7 +213,7 @@ def test_fetch_remotes_quiet_suppresses_output(capsys):
     remote.config_reader.has_option.return_value = True
     remote.fetch.return_value = []
 
-    _fetch_remotes([remote], prune=False, quiet=True)
+    _fetch_remotes([remote], prune=False, args=_args(quiet=True))
 
     assert capsys.readouterr().out == ""
 
@@ -228,10 +229,11 @@ def test_fetch_remotes_git_error(capsys):
     err.stderr = "fatal: repository not found"
     remote.fetch.side_effect = err
 
-    _fetch_remotes([remote], prune=False)
+    _, _, errors = _fetch_remotes([remote], prune=False, args=_args())
 
     out = capsys.readouterr().out
     assert "error" in out
+    assert errors  # error captured in result
 
 
 # ---------------------------------------------------------------------------

@@ -4,9 +4,11 @@
 # Released under the terms of the MIT License. See LICENSE for details.
 
 import argparse
+import json
 import logging
 import os
 import platform
+import sys
 
 from colorama import init as color_init, Style
 
@@ -19,7 +21,14 @@ from gitup.config import (
     list_bookmarks,
     clean_bookmarks,
 )
-from gitup.update import update_bookmarks, update_directories, run_command
+from gitup.update import (
+    update_bookmarks,
+    update_directories,
+    status_bookmarks,
+    status_directories,
+    run_command,
+    RepoResult,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -82,6 +91,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="""after fetching, delete
         remote-tracking branches that no longer exist on their remote""",
     )
+    group_u.add_argument(
+        "--parallel",
+        metavar="N",
+        type=int,
+        default=1,
+        help="update up to N repositories in parallel (default: 1)",
+    )
+    group_u.add_argument(
+        "-s",
+        "--status",
+        action="store_true",
+        help="show local repository status without fetching",
+    )
 
     group_b.add_argument(
         "-a",
@@ -132,6 +154,11 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="command",
         help="run a shell command on all repos",
     )
+    group_a.add_argument(
+        "--json",
+        action="store_true",
+        help="output a JSON summary of results to stdout after updating",
+    )
 
     group_m.add_argument(
         "-h", "--help", action="help", help="show this help message and exit"
@@ -172,6 +199,24 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _emit_json(results: list[RepoResult]) -> None:
+    """Print a JSON summary of *results* to stdout."""
+    total = len(results)
+    updated = sum(1 for r in results if r.status == "updated")
+    up_to_date = sum(1 for r in results if r.status == "up_to_date")
+    errors = sum(1 for r in results if r.status == "error")
+    payload = {
+        "repos": [r.to_dict() for r in results],
+        "summary": {
+            "total": total,
+            "updated": updated,
+            "up_to_date": up_to_date,
+            "errors": errors,
+        },
+    }
+    print(json.dumps(payload, indent=2))
+
+
 def _selftest() -> None:
     """Run the integrated test suite with pytest."""
     from .test import run_tests
@@ -186,6 +231,12 @@ def main() -> None:
     args = parser.parse_args()
 
     _setup_logging(args.verbose)
+
+    # --json collects structured results; it also implies quiet for
+    # human-readable output so that stdout carries only the JSON payload.
+    if args.json:
+        args._results: list[RepoResult] = []
+        args.quiet = True
 
     if not args.quiet:
         print(Style.BRIGHT + "gitup" + Style.RESET_ALL + ": the git-repo-updater")
@@ -212,7 +263,13 @@ def main() -> None:
         clean_bookmarks(args.bookmark_file, quiet=args.quiet)
         acted = True
 
-    if args.command:
+    if args.status:
+        # --status: read-only, no fetch
+        if args.directories_to_update:
+            status_directories(args.directories_to_update, args)
+        else:
+            status_bookmarks(get_bookmarks(args.bookmark_file), args)
+    elif args.command:
         if args.directories_to_update:
             run_command(args.directories_to_update, args)
         if args.update or not args.directories_to_update:
@@ -223,6 +280,9 @@ def main() -> None:
             acted = True
         if args.update or not acted:
             update_bookmarks(get_bookmarks(args.bookmark_file), args)
+
+    if args.json:
+        _emit_json(args._results)
 
 
 def run() -> None:
