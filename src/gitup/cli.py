@@ -4,6 +4,7 @@
 # Released under the terms of the MIT License. See LICENSE for details.
 
 import argparse
+import logging
 import os
 import platform
 
@@ -21,7 +22,7 @@ from gitup.config import (
 from gitup.update import update_bookmarks, update_directories, run_command
 
 
-def _build_parser():
+def _build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser."""
     parser = argparse.ArgumentParser(
         description="Easily update multiple git repositories at once.",
@@ -142,6 +143,18 @@ def _build_parser():
         version="gitup {0} (Python {1})".format(__version__, platform.python_version()),
     )
     group_m.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress all non-error output",
+    )
+    group_m.add_argument(
+        "-V",
+        "--verbose",
+        action="store_true",
+        help="show debug information (overrides --quiet for log messages)",
+    )
+    group_m.add_argument(
         "--selftest",
         action="store_true",
         help="run integrated test suite and exit (pytest must be available)",
@@ -150,21 +163,33 @@ def _build_parser():
     return parser
 
 
-def _selftest():
+def _setup_logging(verbose: bool) -> None:
+    """Configure the root logger based on verbosity level."""
+    level = logging.DEBUG if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(name)s [%(levelname)s]: %(message)s",
+    )
+
+
+def _selftest() -> None:
     """Run the integrated test suite with pytest."""
     from .test import run_tests
 
     run_tests()
 
 
-def main():
+def main() -> None:
     """Parse arguments and then call the appropriate function(s)."""
     parser = _build_parser()
     color_init(autoreset=True)
     args = parser.parse_args()
 
-    print(Style.BRIGHT + "gitup" + Style.RESET_ALL + ": the git-repo-updater")
-    print()
+    _setup_logging(args.verbose)
+
+    if not args.quiet:
+        print(Style.BRIGHT + "gitup" + Style.RESET_ALL + ": the git-repo-updater")
+        print()
 
     if args.selftest:
         _selftest()
@@ -175,16 +200,16 @@ def main():
 
     acted = False
     if args.bookmarks_to_add:
-        add_bookmarks(args.bookmarks_to_add, args.bookmark_file)
+        add_bookmarks(args.bookmarks_to_add, args.bookmark_file, quiet=args.quiet)
         acted = True
     if args.bookmarks_to_del:
-        delete_bookmarks(args.bookmarks_to_del, args.bookmark_file)
+        delete_bookmarks(args.bookmarks_to_del, args.bookmark_file, quiet=args.quiet)
         acted = True
     if args.list_bookmarks:
-        list_bookmarks(args.bookmark_file)
+        list_bookmarks(args.bookmark_file, quiet=args.quiet)
         acted = True
     if args.clean_bookmarks:
-        clean_bookmarks(args.bookmark_file)
+        clean_bookmarks(args.bookmark_file, quiet=args.quiet)
         acted = True
 
     if args.command:
@@ -200,9 +225,9 @@ def main():
             update_bookmarks(get_bookmarks(args.bookmark_file), args)
 
 
-def run():
+def run() -> None:
     """Thin wrapper for main() that catches KeyboardInterrupts."""
     try:
         main()
     except KeyboardInterrupt:
-        print("Stopped by user.")
+        print("\nStopped by user.")

@@ -3,10 +3,12 @@
 # Copyright (C) 2011-2018 Ben Kurtovic <ben.kurtovic@gmail.com>
 # Released under the terms of the MIT License. See LICENSE for details.
 import logging
+from argparse import Namespace
 from glob import glob
 import os
 import re
 import shlex
+import sys
 
 from colorama import Fore, Style
 from git import RemoteReference as RemoteRef, Repo, exc
@@ -29,39 +31,97 @@ INDENT2 = " " * 7
 ERROR = RED + "Error:" + RESET
 
 
+def _print(args: Namespace, *pargs: object, **kwargs: object) -> None:
+    """Print only when not in quiet mode."""
+    if not getattr(args, "quiet", False):
+        print(*pargs, **kwargs)
+
+
+def _eprint(*pargs: object, **kwargs: object) -> None:
+    """Print an error message — always shown regardless of quiet mode."""
+    print(*pargs, file=sys.stderr, **kwargs)
+
+
 class _ProgressMonitor(RemoteProgress):
     """Displays relevant output during the fetching process."""
 
-    def __init__(self):
-        super(_ProgressMonitor, self).__init__()
+    def __init__(self, quiet: bool = False) -> None:
+        super().__init__()
         self._started = False
+        self._quiet = quiet
 
-    def update(self, op_code, cur_count, max_count=None, message=""):
+    def update(
+        self,
+        op_code: int,
+        cur_count: str | float,
+        max_count: str | float | None = None,
+        message: str = "",
+    ) -> None:
         """Called whenever progress changes. Overrides default behavior."""
+        if self._quiet:
+            return
         if op_code & (self.COMPRESSING | self.RECEIVING):
-            cur_count = str(int(cur_count))
-            if max_count:
-                max_count = str(int(max_count))
+            cur = str(int(cur_count))
+            mx = str(int(max_count)) if max_count else None
             if op_code & self.BEGIN:
-                print("\b, " if self._started else " (", end="")
+                print("\b, " if self._started else " (", end="", flush=True)
                 if not self._started:
                     self._started = True
             if op_code & self.END:
                 end = ")"
-            elif max_count:
-                end = "\b" * (1 + len(cur_count) + len(max_count))
+            elif mx:
+                end = "\b" * (1 + len(cur) + len(mx))
             else:
-                end = "\b" * len(cur_count)
-            if max_count:
-                print("{0}/{1}".format(cur_count, max_count), end=end)
+                end = "\b" * len(cur)
+            if mx:
+                print(f"{cur}/{mx}", end=end, flush=True)
             else:
-                print(str(cur_count), end=end)
+                print(cur, end=end, flush=True)
 
 
-def _fetch_remotes(remotes, prune):
+def _collect(paths: list[str], max_depth: int) -> list[str]:
+    """Return all valid repo paths in the given paths, recursively.
+
+    Traversal order is deterministic: directories are sorted alphabetically.
+    """
+    if max_depth == 0:
+        return []
+
+    valid = []
+    for path in paths:
+        try:
+            Repo(path)
+            valid.append(path)
+        except exc.InvalidGitRepositoryError:
+            if not os.path.isdir(path):
+                continue
+            children = [
+                os.path.join(path, entry) for entry in sorted(os.listdir(path))
+            ]
+            logger.debug("Recursing into %s (%d children)", path, len(children))
+            valid += _collect(children, max_depth - 1)
+        except exc.NoSuchPathError:
+            continue
+    return valid
+
+
+def _get_basename(base: str, path: str) -> str:
+    """Return a display name for *path* relative to *base*.
+
+    Uses ``os.path.relpath`` when *base* is a plain directory.  For glob
+    patterns (containing ``*`` or ``?``) the parent directory of the pattern
+    is used as the reference point so the display name stays clean.
+    """
+    ref = base
+    if "*" in base or "?" in base:
+        ref = os.path.dirname(base)
+    return os.path.relpath(path, ref)
+
+
+def _fetch_remotes(remotes: list, prune: bool, quiet: bool = False) -> None:
     """Fetch a list of remotes, displaying progress info along the way."""
 
-    def _get_name(ref):
+    def _get_name(ref: object) -> str:
         """Return the local name of a remote or tag reference."""
         return ref.remote_head if isinstance(ref, RemoteRef) else ref.name
 
@@ -74,14 +134,19 @@ def _fetch_remotes(remotes, prune):
     up_to_date = BLUE + "up to date" + RESET
 
     for remote in remotes:
-        print(INDENT2, "Fetching", BOLD + remote.name, end="")
+        if not quiet:
+            print(INDENT2, "Fetching", BOLD + remote.name, end="")
 
         if not remote.config_reader.has_option("fetch"):
-            print(":", YELLOW + "skipped:", "no configured refspec.")
+            if not quiet:
+                print(":", YELLOW + "skipped:", "no configured refspec.")
+            logger.debug("Remote %s has no configured refspec — skipped.", remote.name)
             continue
 
         try:
-            results = remote.fetch(progress=_ProgressMonitor(), prune=prune)
+            results = remote.fetch(
+                progress=_ProgressMonitor(quiet=quiet), prune=prune
+            )
         except exc.GitCommandError as err:
             # We should have to do this ourselves, but GitPython doesn't give
             # us a sensible way to get the raw stderr...
@@ -89,20 +154,25 @@ def _fetch_remotes(remotes, prune):
             msg = re.sub(r"^stderr: *'(fatal: *)?", "", msg).strip("'")
             if not msg:
                 command = " ".join(shlex.quote(arg) for arg in err.command)
-                msg = "{0} failed with status {1}.".format(command, err.status)
+                msg = f"{command} failed with status {err.status}."
             elif not msg.endswith("."):
                 msg += "."
-            print(":", RED + "error:", msg)
+            logger.debug("Fetch error for remote %s: %s", remote.name, msg)
+            if not quiet:
+                print(":", RED + "error:", msg)
+            else:
+                _eprint(INDENT2, "Fetching", BOLD + remote.name + ":", RED + "error:", msg)
             return
         except AssertionError:  # Seems to be the result of a bug in GitPython
             # This happens when git initiates an auto-gc during fetch:
-            print(
-                ":",
-                RED + "error:",
-                "something went wrong in GitPython,",
-                "but the fetch might have been successful.",
-            )
+            msg = "something went wrong in GitPython, but the fetch might have been successful."
+            logger.debug("AssertionError during fetch of remote %s.", remote.name)
+            if not quiet:
+                print(":", RED + "error:", msg)
+            else:
+                _eprint(INDENT2, "Fetching", BOLD + remote.name + ":", RED + "error:", msg)
             return
+
         rlist = []
         for attr, singular, plural in info:
             names = [
@@ -111,49 +181,62 @@ def _fetch_remotes(remotes, prune):
             if names:
                 desc = singular if len(names) == 1 else plural
                 colored = GREEN + desc + RESET
-                rlist.append("{0} ({1})".format(colored, ", ".join(names)))
-        print(":", (", ".join(rlist) if rlist else up_to_date) + ".")
+                rlist.append(f"{colored} ({', '.join(names)})")
+        summary = (", ".join(rlist) if rlist else up_to_date) + "."
+        logger.debug("Remote %s fetch result: %s", remote.name, summary)
+        if not quiet:
+            print(":", summary)
 
 
-def _update_branch(repo, branch, is_active=False):
+def _update_branch(
+    repo: Repo, branch: object, args: Namespace, is_active: bool = False
+) -> None:
     """Update a single branch."""
-    print(INDENT2, "Updating", BOLD + branch.name, end=": ")
+    quiet = getattr(args, "quiet", False)
+    _print(args, INDENT2, "Updating", BOLD + branch.name, end=": ")
     upstream = branch.tracking_branch()
     if not upstream:
-        print(YELLOW + "skipped:", "no upstream is tracked.")
+        _print(args, YELLOW + "skipped:", "no upstream is tracked.")
+        logger.debug("Branch %s has no upstream — skipped.", branch.name)
         return
     try:
         branch.commit
     except ValueError:
-        print(YELLOW + "skipped:", "branch has no revisions.")
+        _print(args, YELLOW + "skipped:", "branch has no revisions.")
+        logger.debug("Branch %s has no revisions — skipped.", branch.name)
         return
     try:
         upstream.commit
     except ValueError:
-        print(YELLOW + "skipped:", "upstream does not exist.")
+        _print(args, YELLOW + "skipped:", "upstream does not exist.")
+        logger.debug("Upstream of %s does not exist — skipped.", branch.name)
         return
 
     try:
         base = repo.git.merge_base(branch.commit, upstream.commit)
     except exc.GitCommandError as err:
-        logger.debug(err)
-        print(YELLOW + "skipped:", "can't find merge base with upstream.")
+        logger.debug("merge_base failed for %s: %s", branch.name, err)
+        _print(args, YELLOW + "skipped:", "can't find merge base with upstream.")
         return
 
     if repo.commit(base) == upstream.commit:
-        print(BLUE + "up to date", end=".\n")
+        _print(args, BLUE + "up to date", end=".\n")
+        logger.debug("Branch %s is up to date.", branch.name)
         return
 
     if is_active:
         try:
             repo.git.merge(upstream.name, ff_only=True)
-            print(GREEN + "done", end=".\n")
+            _print(args, GREEN + "done", end=".\n")
+            logger.debug("Fast-forwarded active branch %s.", branch.name)
         except exc.GitCommandError as err:
             msg = err.stderr
             if "local changes" in msg and "would be overwritten" in msg:
-                print(YELLOW + "skipped:", "uncommitted changes.")
+                _print(args, YELLOW + "skipped:", "uncommitted changes.")
+                logger.debug("Branch %s has uncommitted changes — skipped.", branch.name)
             else:
-                print(YELLOW + "skipped:", "not possible to fast-forward.")
+                _print(args, YELLOW + "skipped:", "not possible to fast-forward.")
+                logger.debug("Branch %s cannot be fast-forwarded.", branch.name)
     else:
         status = repo.git.merge_base(
             branch.commit,
@@ -163,13 +246,15 @@ def _update_branch(repo, branch, is_active=False):
             with_exceptions=False,
         )[0]
         if status != 0:
-            print(YELLOW + "skipped:", "not possible to fast-forward.")
+            _print(args, YELLOW + "skipped:", "not possible to fast-forward.")
+            logger.debug("Branch %s cannot be fast-forwarded (status %s).", branch.name, status)
         else:
             repo.git.branch(branch.name, upstream.name, force=True)
-            print(GREEN + "done", end=".\n")
+            _print(args, GREEN + "done", end=".\n")
+            logger.debug("Updated inactive branch %s.", branch.name)
 
 
-def _update_repository(repo, repo_name, args):
+def _update_repository(repo: Repo, repo_name: str, args: Namespace) -> None:
     """Update a single git repository by fetching remotes and rebasing/merging.
 
     The specific actions depend on the arguments given. We will fetch all
@@ -179,7 +264,9 @@ def _update_repository(repo, repo_name, args):
     upstreams. If *args.prune* is ``True``, remote-tracking branches that no
     longer exist on their remote after fetching will be deleted.
     """
-    print(INDENT1, BOLD + repo_name + ":")
+    quiet = getattr(args, "quiet", False)
+    _print(args, INDENT1, BOLD + repo_name + ":")
+    logger.debug("Updating repository: %s", repo_name)
 
     try:
         active = repo.active_branch
@@ -187,46 +274,43 @@ def _update_repository(repo, repo_name, args):
         active = None
     if args.current_only:
         if not active:
-            print(
-                INDENT2,
-                ERROR,
-                "--current-only doesn't make sense with a detached HEAD.",
-            )
+            _eprint(INDENT2, ERROR, "--current-only doesn't make sense with a detached HEAD.")
             return
         ref = active.tracking_branch()
         if not ref:
-            print(INDENT2, ERROR, "no remote tracked by current branch.")
+            _eprint(INDENT2, ERROR, "no remote tracked by current branch.")
             return
         remotes = [repo.remotes[ref.remote_name]]
     else:
         remotes = repo.remotes
 
     if not remotes:
-        print(INDENT2, ERROR, "no remotes configured to fetch.")
+        _eprint(INDENT2, ERROR, "no remotes configured to fetch.")
         return
-    _fetch_remotes(remotes, args.prune)
+    _fetch_remotes(remotes, args.prune, quiet=quiet)
 
     if not args.fetch_only:
         for branch in sorted(repo.heads, key=lambda b: b.name):
-            _update_branch(repo, branch, branch == active)
+            _update_branch(repo, branch, args, is_active=(branch == active))
 
 
-def _run_command(repo, repo_name, args):
+def _run_command(repo: Repo, repo_name: str, args: Namespace) -> None:
     """Run an arbitrary shell command on the given repository."""
-    print(INDENT1, BOLD + repo_name + ":")
+    _print(args, INDENT1, BOLD + repo_name + ":")
 
     cmd = shlex.split(args.command)
     try:
         out = repo.git.execute(cmd, with_extended_output=True, with_exceptions=False)
     except exc.GitCommandNotFound as err:
-        print(INDENT2, ERROR, err)
+        _eprint(INDENT2, ERROR, err)
         return
 
-    for line in out[1].splitlines() + out[2].splitlines():
-        print(INDENT2, line)
+    if not getattr(args, "quiet", False):
+        for line in out[1].splitlines() + out[2].splitlines():
+            print(INDENT2, line)
 
 
-def _dispatch(base_path, callback, args):
+def _dispatch(base_path: str, callback: object, args: Namespace) -> None:
     """Apply a callback function on each valid repo in the given path.
 
     Determine whether the directory is a git repo on its own, a directory of
@@ -236,38 +320,6 @@ def _dispatch(base_path, callback, args):
 
     The given args are passed directly to the callback function after the repo.
     """
-
-    def _collect(paths, max_depth):
-        """Return all valid repo paths in the given paths, recursively."""
-        if max_depth == 0:
-            return []
-
-        valid = []
-        for path in paths:
-            try:
-                Repo(path)
-                valid.append(path)
-            except exc.InvalidGitRepositoryError:
-                if not os.path.isdir(path):
-                    continue
-                children = [os.path.join(path, it) for it in os.listdir(path)]
-                valid += _collect(children, max_depth - 1)
-            except exc.NoSuchPathError:
-                continue
-        return valid
-
-    def _get_basename(base, path):
-        """Return a reasonable name for a repo path in the given base."""
-        if path.startswith(base + os.path.sep):
-            return path.split(base + os.path.sep, 1)[1]
-        prefix = os.path.commonprefix([base, path])
-        while not base.startswith(prefix + os.path.sep):
-            old = prefix
-            prefix = os.path.split(prefix)[0]
-            if prefix == old:
-                break  # Prevent infinite loop, but should be almost impossible
-        return path.split(prefix + os.path.sep, 1)[1]
-
     base = os.path.expanduser(base_path)
     max_depth = args.max_depth
     if max_depth >= 0:
@@ -280,22 +332,22 @@ def _dispatch(base_path, callback, args):
         if is_comment(base):
             comment = get_comment(base)
             if comment:
-                print(CYAN + BOLD + comment)
+                _print(args, CYAN + BOLD + comment)
             return
         paths = glob(base)
         if not paths:
-            print(ERROR, BOLD + base, "doesn't exist!")
+            _eprint(ERROR, BOLD + base, "doesn't exist!")
             return
         valid = _collect(paths, max_depth)
     except exc.InvalidGitRepositoryError:
         if not os.path.isdir(base) or args.max_depth == 0:
-            print(ERROR, BOLD + base, "isn't a repository!")
+            _eprint(ERROR, BOLD + base, "isn't a repository!")
             return
         valid = _collect([base], max_depth)
 
     base = os.path.abspath(base)
     suffix = "" if len(valid) == 1 else "s"
-    print(BOLD + base, "({0} repo{1}):".format(len(valid), suffix))
+    _print(args, BOLD + base, "({0} repo{1}):".format(len(valid), suffix))
 
     valid = [os.path.abspath(path) for path in valid]
     paths = [(_get_basename(base, path), path) for path in valid]
@@ -303,33 +355,33 @@ def _dispatch(base_path, callback, args):
         callback(Repo(path), name, args)
 
 
-def is_comment(path):
-    """Does the line start with a # symbol?"""
+def is_comment(path: str) -> bool:
+    """Return True if the line starts with a ``#`` symbol."""
     return path.lstrip().startswith("#")
 
 
-def get_comment(path):
-    """Return the string minus the comment symbol."""
+def get_comment(path: str) -> str:
+    """Return the string content after stripping the leading ``#`` comment marker."""
     return path.lstrip().lstrip("#").strip()
 
 
-def update_bookmarks(bookmarks, args):
+def update_bookmarks(bookmarks: list[str], args: Namespace) -> None:
     """Loop through and update all bookmarks."""
     if not bookmarks:
-        print("You don't have any bookmarks configured! Get help with 'gitup -h'.")
+        _print(args, "You don't have any bookmarks configured! Get help with 'gitup -h'.")
         return
 
     for path in bookmarks:
         _dispatch(path, _update_repository, args)
 
 
-def update_directories(paths, args):
+def update_directories(paths: list[str], args: Namespace) -> None:
     """Update a list of directories supplied by command arguments."""
     for path in paths:
         _dispatch(path, _update_repository, args)
 
 
-def run_command(paths, args):
+def run_command(paths: list[str], args: Namespace) -> None:
     """Run an arbitrary shell command on all repos."""
     for path in paths:
         _dispatch(path, _run_command, args)
