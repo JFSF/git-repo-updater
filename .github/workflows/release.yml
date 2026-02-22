@@ -1,0 +1,150 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"          # trigger on version tags: v0.5.3, v1.0.0, etc.
+  workflow_dispatch:  # allow manual runs from the GitHub UI
+
+permissions:
+  contents: write   # needed to create GitHub Releases and upload assets
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build a standalone executable for each platform
+  # ─────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: gitup-linux-x86_64
+            executable: dist/gitup
+
+          - os: windows-latest
+            artifact_name: gitup-windows-x86_64.exe
+            executable: dist/gitup.exe
+
+          - os: macos-latest
+            artifact_name: gitup-macos-arm64
+            executable: dist/gitup
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # Install the package itself plus PyInstaller
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller
+          pip install .
+
+      # Build the single-file executable.
+      # --onefile       → everything packed in one binary
+      # --name gitup    → output file name
+      # --strip         → strip debug symbols (smaller binary, Linux/macOS only)
+      # --hidden-import → modules discovered at runtime that PyInstaller misses
+      - name: Build executable (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          pyinstaller \
+            --onefile \
+            --name gitup \
+            --strip \
+            --hidden-import gitup.migrate \
+            --hidden-import gitup.profile \
+            --hidden-import gitup.notify \
+            --hidden-import gitup.history \
+            --hidden-import gitup.tui \
+            src/gitup/__main__.py
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller `
+            --onefile `
+            --name gitup `
+            --hidden-import gitup.migrate `
+            --hidden-import gitup.profile `
+            --hidden-import gitup.notify `
+            --hidden-import gitup.history `
+            --hidden-import gitup.tui `
+            src/gitup/__main__.py
+
+      # Quick smoke-test: the binary must print the version without crashing
+      - name: Smoke test
+        shell: bash
+        run: ${{ matrix.executable }} --version
+
+      # Rename to include the platform suffix before uploading
+      - name: Rename artifact
+        shell: bash
+        run: |
+          cp "${{ matrix.executable }}" "${{ matrix.artifact_name }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Create a GitHub Release and attach all binaries (only on tag push)
+  # ─────────────────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish when triggered by a version tag
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout (for CHANGELOG)
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      # Extract release notes for this tag from CHANGELOG
+      - name: Extract release notes
+        id: notes
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"          # e.g. v0.5.3
+          VERSION="${TAG#v}"                # e.g.  0.5.3
+          # Pull the section between this version and the previous one
+          NOTES=$(awk "/^${VERSION}$/{found=1; next} found && /^[0-9]/{exit} found{print}" CHANGELOG)
+          if [ -z "$NOTES" ]; then
+            NOTES="See CHANGELOG for details."
+          fi
+          # GitHub Actions multiline output
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "gitup ${{ github.ref_name }}"
+          body: ${{ steps.notes.outputs.notes }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'dev') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
+          files: |
+            artifacts/gitup-linux-x86_64/gitup-linux-x86_64
+            artifacts/gitup-windows-x86_64.exe/gitup-windows-x86_64.exe
+            artifacts/gitup-macos-arm64/gitup-macos-arm64
