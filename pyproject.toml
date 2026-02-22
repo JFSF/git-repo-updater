@@ -33,6 +33,9 @@ classifiers = [
   "Topic :: Software Development :: Version Control :: Git"
 ]
 
+[project.optional-dependencies]
+tui = ["textual>=0.80.0"]
+
 [project.urls]
 Repository = "https://github.com/earwig/git-repo-updater"
 Issues = "https://github.com/earwig/git-repo-updater/issues"
@@ -44,6 +47,7 @@ gitup = "gitup.cli:run"
 [dependency-groups]
 dev = [
     "pytest>=8.3.5",
+    "textual>=0.80.0",
 ]
 
 [build-system]

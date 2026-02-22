@@ -430,11 +430,14 @@ def _update_repository(repo: Repo, repo_name: str, args: Namespace) -> None:
 
 
 def _store_result(args: Namespace, result: RepoResult) -> None:
-    """Append *result* to ``args._results`` if the list exists."""
+    """Append *result* to ``args._results`` and invoke ``args._on_repo_done``."""
     results_list = getattr(args, "_results", None)
     if results_list is not None:
         with _print_lock:
             results_list.append(result)
+    callback = getattr(args, "_on_repo_done", None)
+    if callable(callback):
+        callback(result)
 
 
 def _status_repository(repo: Repo, repo_name: str, args: Namespace) -> None:
